@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from database import CorpusDB, DomainError
+from dispatch import Dispatcher
 
 BASE = Path(__file__).resolve().parent
 DB_PATH = os.environ.get("CORPUS_DB", str(BASE / "corpus.db"))
@@ -14,6 +15,7 @@ DB_PATH = os.environ.get("CORPUS_DB", str(BASE / "corpus.db"))
 
 class Handler(BaseHTTPRequestHandler):
     db = CorpusDB(DB_PATH)
+    dispatcher = Dispatcher(db)
 
     def log_message(self, fmt, *args):
         return
@@ -77,6 +79,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": self.db.add_item(int(parts[2]), int(body.get("ordinal", 0)), str(body.get("text", "")))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "assign":
                 return self._json(201, {"ok": True, "id": self.db.assign(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)))})
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "dispatch-cap":
+                return self._json(201, {"ok": True, **self.dispatcher.set_cap(
+                    int(parts[2]), int(body.get("annotator_id", 0)), body.get("cap", -1)
+                )})
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "dispatch":
+                return self._json(200, {"ok": True, **self.dispatcher.assign_ordinals(
+                    int(parts[2]), int(body.get("annotator_id", 0)), body.get("ordinals", [])
+                )})
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "release":
+                return self._json(200, {"ok": True, **self.dispatcher.release(
+                    int(parts[2]), int(body.get("annotator_id", 0)), body.get("ordinal", 0)
+                )})
             if path == "/api/annotations":
                 return self._json(201, {"ok": True, "id": self.db.submit_annotation(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)), str(body.get("label", "")), str(body.get("comment", "")))})
             if path == "/api/adjudications":

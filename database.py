@@ -116,6 +116,12 @@ class CorpusDB:
               frozen_by INTEGER NOT NULL REFERENCES users(id),
               frozen_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS dispatch_quotas (
+              batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+              annotator_id INTEGER NOT NULL REFERENCES users(id),
+              cap INTEGER NOT NULL CHECK(cap >= 0),
+              PRIMARY KEY(batch_id, annotator_id)
+            );
             """
         )
         self.conn.commit()
@@ -180,10 +186,14 @@ class CorpusDB:
         return int(cur.lastrowid)
 
     def assign(self, item_id: int, annotator_id: int) -> int:
-        item = self.conn.execute("SELECT batch_id FROM items WHERE id=?", (item_id,)).fetchone()
+        item = self.conn.execute(
+            "SELECT i.batch_id,b.status FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
+        ).fetchone()
         user = self.conn.execute("SELECT role FROM users WHERE id=?", (annotator_id,)).fetchone()
         if not item or not user or user["role"] != "annotator":
             raise DomainError("条目不存在或用户不是标注员")
+        if item["status"] == "frozen":
+            raise DomainError("冻结批次不能继续分派")
         with self.transaction():
             self.conn.execute("UPDATE batches SET status='annotating' WHERE id=? AND status='draft'", (item["batch_id"],))
             try:
@@ -194,6 +204,78 @@ class CorpusDB:
             except sqlite3.IntegrityError as exc:
                 raise DomainError("同一标注员不能重复领取同一条目") from exc
         return int(cur.lastrowid)
+
+    def set_dispatch_cap(self, batch_id: int, annotator_id: int, cap: int) -> None:
+        """存储层：按批次为标注员设置未提交上限（0 表示清空未提交名额）。"""
+        with self.transaction():
+            if cap:
+                self.conn.execute(
+                    "INSERT INTO dispatch_quotas(batch_id,annotator_id,cap) VALUES(?,?,?) "
+                    "ON CONFLICT(batch_id,annotator_id) DO UPDATE SET cap=excluded.cap",
+                    (batch_id, annotator_id, cap),
+                )
+            else:
+                self.conn.execute(
+                    "DELETE FROM dispatch_quotas WHERE batch_id=? AND annotator_id=?", (batch_id, annotator_id)
+                )
+
+    def get_dispatch_cap(self, batch_id: int, annotator_id: int) -> int | None:
+        row = self.conn.execute(
+            "SELECT cap FROM dispatch_quotas WHERE batch_id=? AND annotator_id=?", (batch_id, annotator_id)
+        ).fetchone()
+        return None if row is None else int(row["cap"])
+
+    def dispatch_context(self, batch_id: int, annotator_id: int) -> dict:
+        """存储层：一次性取齐批量分派判定所需的全部状态。"""
+        batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        user = self.conn.execute("SELECT role FROM users WHERE id=?", (annotator_id,)).fetchone()
+        cap_row = self.conn.execute(
+            "SELECT cap FROM dispatch_quotas WHERE batch_id=? AND annotator_id=?", (batch_id, annotator_id)
+        ).fetchone()
+        items = {
+            int(row["ordinal"]): int(row["id"])
+            for row in self.conn.execute("SELECT id,ordinal FROM items WHERE batch_id=?", (batch_id,)).fetchall()
+        }
+        holders: dict[int, set[int]] = {}
+        for row in self.conn.execute(
+            "SELECT item_id,annotator_id,status FROM assignments WHERE batch_id=?", (batch_id,)
+        ).fetchall():
+            holders.setdefault(int(row["item_id"]), set()).add(int(row["annotator_id"]))
+        open_count = self.conn.execute(
+            "SELECT COUNT(*) FROM assignments WHERE batch_id=? AND annotator_id=? AND status='assigned'",
+            (batch_id, annotator_id),
+        ).fetchone()[0]
+        return {
+            "batch": dict(batch) if batch else None,
+            "user_role": user["role"] if user else None,
+            "cap": None if cap_row is None else int(cap_row["cap"]),
+            "items": items,
+            "holders": holders,
+            "open_count": int(open_count),
+        }
+
+    def bulk_insert_assignments(self, batch_id: int, annotator_id: int, item_ids: list[int]) -> None:
+        """存储层：单事务写入批量分派；冻结批次与重复记录由调用方先行判定。"""
+        with self.transaction():
+            self.conn.execute("UPDATE batches SET status='annotating' WHERE id=? AND status='draft'", (batch_id,))
+            self.conn.executemany(
+                "INSERT INTO assignments(batch_id,item_id,annotator_id) VALUES(?,?,?)",
+                [(batch_id, item_id, annotator_id) for item_id in item_ids],
+            )
+
+    def get_open_assignment(self, batch_id: int, ordinal: int, annotator_id: int) -> dict | None:
+        """存储层：按序号查找该标注员在批次内的未提交分派。"""
+        row = self.conn.execute(
+            "SELECT a.id,a.status FROM assignments a JOIN items i ON i.id=a.item_id "
+            "WHERE a.batch_id=? AND i.ordinal=? AND a.annotator_id=?",
+            (batch_id, ordinal, annotator_id),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def delete_assignment(self, assignment_id: int) -> None:
+        """存储层：删除一条分派记录（仅限未提交状态，调用方负责判定）。"""
+        with self.transaction():
+            self.conn.execute("DELETE FROM assignments WHERE id=?", (assignment_id,))
 
     def submit_annotation(self, item_id: int, annotator_id: int, label: str, comment: str = "") -> int:
         if not label.strip():
@@ -422,4 +504,8 @@ class CorpusDB:
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
             "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
             "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "assignments": [dict(r) for r in self.conn.execute("SELECT * FROM assignments ORDER BY id")],
+            "dispatch_quotas": [dict(r) for r in self.conn.execute(
+                "SELECT batch_id,annotator_id,cap FROM dispatch_quotas ORDER BY batch_id,annotator_id"
+            )],
         }

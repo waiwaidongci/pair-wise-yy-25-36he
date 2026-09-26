@@ -4,5 +4,20 @@
 <section><h2>标注与讨论</h2><div class="grid"><input id="item" type="number" placeholder="条目 ID"><input id="user" type="number" placeholder="用户 ID"><input id="label" placeholder="标签"><textarea id="comment" placeholder="备注"></textarea><input id="batch" type="number" placeholder="批次 ID"><input id="manager" type="number" placeholder="管理员 ID"></div>
 <button onclick="annotate()">提交标注</button><button onclick="loadItem()">查看条目与讨论可见性</button><button onclick="disagreements()">查看分歧</button><button onclick="consistency()">一致性</button><button onclick="freeze()">冻结金标准</button><pre id="result"></pre></section>
 <section><h2>仲裁</h2><input id="arb" type="number" placeholder="仲裁员 ID"><input id="final" placeholder="最终标签"><input id="reason" placeholder="理由至少5字"><button onclick="adjudicate()">提交仲裁</button></section>
-<script>const result=document.querySelector('#result');const show=x=>result.textContent=JSON.stringify(x,null,2);async function get(u){return show(await(await fetch(u)).json())}async function post(u,b){return show(await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}async function load(){show(await(await fetch('/api/state')).json())}function annotate(){post('/api/annotations',{item_id:+item.value,annotator_id:+user.value,label:label.value,comment:comment.value})}function loadItem(){get('/api/items/'+item.value+'?user_id='+user.value)}function disagreements(){get('/api/batches/'+batch.value+'/disagreements')}function consistency(){get('/api/batches/'+batch.value+'/consistency')}function adjudicate(){post('/api/adjudications',{item_id:+item.value,arbitrator_id:+arb.value,final_label:final.value,reason:reason.value})}function freeze(){post('/api/batches/'+batch.value+'/freeze',{manager_id:+manager.value})}load()</script>
+<section><h2>批量分派</h2>
+<input id="d_batch" type="number" placeholder="批次 ID">
+<input id="d_annotator" type="number" placeholder="标注员 ID">
+<input id="d_cap" type="number" min="0" placeholder="未提交上限（0=取消）">
+<input id="d_ordinals" placeholder="条目序号，逗号分隔，如 3,4,5">
+<button onclick="setCap()">设置/修改上限</button>
+<button onclick="bulkDispatch()">批量分派</button>
+<button onclick="releaseOne()">退回未提交任务（单个序号）</button>
+<pre id="dispatch_result"></pre></section>
+<script>const result=document.querySelector('#result');const show=x=>result.textContent=JSON.stringify(x,null,2);async function get(u){return show(await(await fetch(u)).json())}async function post(u,b){return show(await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}async function load(){show(await(await fetch('/api/state')).json())}function annotate(){post('/api/annotations',{item_id:+item.value,annotator_id:+user.value,label:label.value,comment:comment.value})}function loadItem(){get('/api/items/'+item.value+'?user_id='+user.value)}function disagreements(){get('/api/batches/'+batch.value+'/disagreements')}function consistency(){get('/api/batches/'+batch.value+'/consistency')}function adjudicate(){post('/api/adjudications',{item_id:+item.value,arbitrator_id:+arb.value,final_label:final.value,reason:reason.value})}function freeze(){post('/api/batches/'+batch.value+'/freeze',{manager_id:+manager.value})}
+const dShow=x=>document.querySelector('#dispatch_result').textContent=JSON.stringify(x,null,2);
+async function dPost(u,b){dShow(await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}
+function setCap(){dPost('/api/batches/'+d_batch.value+'/dispatch-cap',{annotator_id:+d_annotator.value,cap:parseInt(d_cap.value,10)})}
+function bulkDispatch(){dPost('/api/batches/'+d_batch.value+'/dispatch',{annotator_id:+d_annotator.value,ordinals:d_ordinals.value.split(',').map(s=>parseInt(s.trim(),10)).filter(n=>!Number.isNaN(n))})}
+function releaseOne(){const ords=d_ordinals.value.split(',').map(s=>parseInt(s.trim(),10)).filter(n=>!Number.isNaN(n));dPost('/api/batches/'+d_batch.value+'/release',{annotator_id:+d_annotator.value,ordinal:ords[0]||0})}
+load()</script>
 </html>

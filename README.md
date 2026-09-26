@@ -26,6 +26,7 @@ python -m unittest discover -s tests -v
 
 - `POST /api/users`、`POST /api/guidelines`、`POST /api/batches`
 - `POST /api/batches/{id}/items`、`POST /api/batches/{id}/assign`
+- `POST /api/batches/{id}/dispatch-cap`、`POST /api/batches/{id}/dispatch`、`POST /api/batches/{id}/release`
 - `POST /api/annotations`、`POST /api/adjudications`
 - `GET /api/items/{id}?user_id=`
 - `GET /api/batches/{id}/disagreements`
@@ -34,3 +35,13 @@ python -m unittest discover -s tests -v
 - `GET /api/batches/{id}/gold`
 
 一致性同时返回逐条成对一致率和 Fleiss Kappa。冻结要求每条至少有两人标注、没有未仲裁分歧；冻结后不能修改标注，导出结果来自不可变的 `gold_records`。
+
+## 批量分派
+
+管理员按批次为每位标注员设置“未提交上限”，再一次提交标注员和若干条目序号：
+
+- `POST /api/batches/{id}/dispatch-cap`：请求体 `{"annotator_id":1,"cap":3}`，`cap=0` 取消上限；
+- `POST /api/batches/{id}/dispatch`：请求体 `{"annotator_id":1,"ordinals":[3,4,5]}`，按提交顺序处理；
+- `POST /api/batches/{id}/release`：请求体 `{"annotator_id":1,"ordinal":4}`，退回未提交任务。
+
+分派返回 `assigned`（成功项）、`skipped`（含跳过原因：已分给本人 / 已分给他人 / 条目不在该批次中 / 请求内序号重复 / 序号非法 / 超出剩余名额本次未写入）和 `remaining`（剩余名额）。名额 = 上限 − 该标注员在本批次中状态为 `assigned` 的分派数；提交后不再占用名额，退回后名额重算，已提交标注保持不变。新增数超过剩余名额时整批不写入；冻结批次不能设置上限、分派或退回。判定、存储、页面操作分别位于 `dispatch.py`、`database.py`、`app.py` 与 `static/index.html`。
