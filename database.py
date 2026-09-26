@@ -116,6 +116,13 @@ class CorpusDB:
               frozen_by INTEGER NOT NULL REFERENCES users(id),
               frozen_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS assignment_caps (
+              batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+              annotator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              cap INTEGER NOT NULL CHECK(cap >= 0),
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(batch_id, annotator_id)
+            );
             """
         )
         self.conn.commit()
@@ -194,6 +201,110 @@ class CorpusDB:
             except sqlite3.IntegrityError as exc:
                 raise DomainError("同一标注员不能重复领取同一条目") from exc
         return int(cur.lastrowid)
+
+    # ---- 批量分派：存储层（只负责读写，不含分派规则判定） ----
+
+    def get_batch_status(self, batch_id: int) -> str | None:
+        row = self.conn.execute("SELECT status FROM batches WHERE id=?", (batch_id,)).fetchone()
+        return row["status"] if row else None
+
+    def get_annotator_role(self, annotator_id: int) -> str | None:
+        row = self.conn.execute("SELECT role FROM users WHERE id=?", (annotator_id,)).fetchone()
+        return row["role"] if row else None
+
+    def get_assignment_cap(self, batch_id: int, annotator_id: int) -> int | None:
+        row = self.conn.execute(
+            "SELECT cap FROM assignment_caps WHERE batch_id=? AND annotator_id=?", (batch_id, annotator_id)
+        ).fetchone()
+        return int(row["cap"]) if row else None
+
+    def set_assignment_cap(self, batch_id: int, annotator_id: int, cap: int) -> None:
+        with self.transaction():
+            self.conn.execute(
+                "INSERT INTO assignment_caps(batch_id,annotator_id,cap,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(batch_id,annotator_id) DO UPDATE SET cap=excluded.cap,updated_at=excluded.updated_at",
+                (batch_id, annotator_id, cap, datetime.now().isoformat()),
+            )
+
+    def count_unsubmitted(self, batch_id: int, annotator_id: int) -> int:
+        return int(self.conn.execute(
+            "SELECT COUNT(*) FROM assignments WHERE batch_id=? AND annotator_id=? AND status='assigned'",
+            (batch_id, annotator_id),
+        ).fetchone()[0])
+
+    def items_by_ordinal(self, batch_id: int, ordinals: list[int]) -> dict[int, sqlite3.Row]:
+        if not ordinals:
+            return {}
+        placeholders = ",".join("?" for _ in ordinals)
+        return {
+            row["ordinal"]: row
+            for row in self.conn.execute(
+                f"SELECT id,batch_id,ordinal FROM items WHERE batch_id=? AND ordinal IN ({placeholders})",
+                [batch_id, *ordinals],
+            ).fetchall()
+        }
+
+    def assigned_annotators_for_items(self, item_ids: list[int]) -> dict[int, list[int]]:
+        owners: dict[int, list[int]] = {}
+        if not item_ids:
+            return owners
+        placeholders = ",".join("?" for _ in item_ids)
+        for row in self.conn.execute(
+            f"SELECT item_id,annotator_id FROM assignments WHERE item_id IN ({placeholders})", item_ids
+        ).fetchall():
+            owners.setdefault(row["item_id"], []).append(row["annotator_id"])
+        return owners
+
+    def insert_assignments(self, batch_id: int, annotator_id: int, item_ids: list[int]) -> int:
+        """在单事务内二次校验剩余名额后写入分配，返回写入条数。超额则整体不写入。"""
+        if not item_ids:
+            return 0
+        with self.transaction():
+            cap = self.get_assignment_cap(batch_id, annotator_id)
+            used = self.count_unsubmitted(batch_id, annotator_id)
+            if cap is None or used + len(item_ids) > cap:
+                raise DomainError("超出剩余名额，未写入任何分派")
+            self.conn.execute("UPDATE batches SET status='annotating' WHERE id=? AND status='draft'", (batch_id,))
+            now_rows = self.conn.execute(
+                "SELECT item_id FROM assignments WHERE batch_id=? AND annotator_id=?", (batch_id, annotator_id)
+            ).fetchall()
+            existing = {row["item_id"] for row in now_rows}
+            placeholders = ",".join("?" for _ in item_ids)
+            conflicts = self.conn.execute(
+                f"SELECT DISTINCT item_id FROM assignments WHERE item_id IN ({placeholders})", item_ids
+            ).fetchall()
+            if conflicts or any(item_id in existing for item_id in item_ids):
+                raise DomainError("条目已被领取，未写入任何分派")
+            self.conn.executemany(
+                "INSERT INTO assignments(batch_id,item_id,annotator_id) VALUES(?,?,?)",
+                [(batch_id, item_id, annotator_id) for item_id in item_ids],
+            )
+        return len(item_ids)
+
+    def assignment_states(self, batch_id: int, annotator_id: int, item_ids: list[int]) -> dict[int, str]:
+        if not item_ids:
+            return {}
+        placeholders = ",".join("?" for _ in item_ids)
+        return {
+            row["item_id"]: row["status"]
+            for row in self.conn.execute(
+                f"SELECT item_id,status FROM assignments WHERE batch_id=? AND annotator_id=? AND item_id IN ({placeholders})",
+                [batch_id, annotator_id, *item_ids],
+            ).fetchall()
+        }
+
+    def delete_assignments(self, batch_id: int, annotator_id: int, item_ids: list[int]) -> int:
+        """仅删除本人未提交(status='assigned')的分派，返回删除条数。"""
+        if not item_ids:
+            return 0
+        placeholders = ",".join("?" for _ in item_ids)
+        with self.transaction():
+            cur = self.conn.execute(
+                f"DELETE FROM assignments WHERE batch_id=? AND annotator_id=? AND status='assigned' "
+                f"AND item_id IN ({placeholders})",
+                [batch_id, annotator_id, *item_ids],
+            )
+            return cur.rowcount
 
     def submit_annotation(self, item_id: int, annotator_id: int, label: str, comment: str = "") -> int:
         if not label.strip():
@@ -422,4 +533,10 @@ class CorpusDB:
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
             "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
             "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "assignments": [dict(r) for r in self.conn.execute(
+                "SELECT id,batch_id,item_id,annotator_id,status FROM assignments ORDER BY id"
+            )],
+            "assignment_caps": [dict(r) for r in self.conn.execute(
+                "SELECT batch_id,annotator_id,cap,updated_at FROM assignment_caps ORDER BY batch_id,annotator_id"
+            )],
         }
